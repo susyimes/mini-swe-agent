@@ -1,15 +1,20 @@
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from typer.testing import CliRunner
 
 from minisweagent.run.extra.github_growth import (
     GitHubEventsClient,
     GrowthState,
     app,
+    build_self_evolution_plan,
     extract_growth_signals,
     normalize_event,
+    prepare_self_evolution_branch,
     run_intake_once,
+    run_self_evolution_agent,
     select_new_events,
 )
 from minisweagent.run.utilities.mini_extra import get_docstring
@@ -63,6 +68,22 @@ class FakeSession:
     def get(self, url: str, **kwargs) -> FakeResponse:
         self.requests.append({"url": url, **kwargs})
         return FakeResponse(self.payload)
+
+
+def digest_with_proposal() -> dict:
+    return {
+        "generated_at": "2026-06-12T00:00:00Z",
+        "proposals": [
+            {
+                "title": "Borrow cautiously from example/repo: Improve agent workflow tests",
+                "source_url": "https://github.com/example/repo/pull/1",
+                "risk": "normal",
+                "why_it_matters": "matched topics: agent, workflow",
+                "suggested_next_step": "compare the pull request approach with local agent behavior",
+                "approval_gate": "Open a reviewed PR before merging.",
+            }
+        ],
+    }
 
 
 def test_normalize_pull_request_event_extracts_reviewable_text():
@@ -154,3 +175,68 @@ def test_github_growth_help_and_mini_extra_registration():
     assert result.exit_code == 0
     assert "Collect recent GitHub activity" in result.stdout
     assert "github-growth" in get_docstring()
+
+
+def test_build_self_evolution_plan_requires_signal_unless_forced(tmp_path):
+    empty_digest = {"generated_at": "2026-06-12T00:00:00Z", "proposals": []}
+
+    assert build_self_evolution_plan(empty_digest, repo_path=tmp_path) is None
+
+    forced = build_self_evolution_plan(empty_digest, repo_path=tmp_path, force=True)
+    assert forced is not None
+    assert "Improve the GitHub growth self-evolution loop" in forced.task
+
+
+def test_build_self_evolution_plan_contains_bounded_agent_task(tmp_path):
+    plan = build_self_evolution_plan(digest_with_proposal(), repo_path=tmp_path)
+
+    assert plan is not None
+    assert plan.branch_name.startswith("codex/self-evolve/")
+    assert "You are mini-swe-agent improving mini-swe-agent itself." in plan.task
+    assert "Do not push, merge" in plan.task
+    assert "Improve agent workflow tests" in plan.task
+
+
+def test_prepare_self_evolution_branch_rejects_dirty_worktree(tmp_path):
+    plan = build_self_evolution_plan(digest_with_proposal(), repo_path=tmp_path)
+    assert plan is not None
+
+    def dirty_runner(command, **kwargs):
+        assert command == ["git", "status", "--porcelain"]
+        return subprocess.CompletedProcess(command, 0, stdout=" M file.py\n", stderr="")
+
+    with pytest.raises(RuntimeError, match="dirty worktree"):
+        prepare_self_evolution_branch(plan, command_runner=dirty_runner)
+
+
+def test_prepare_branch_and_run_agent_invoke_expected_commands(tmp_path):
+    plan = build_self_evolution_plan(digest_with_proposal(), repo_path=tmp_path)
+    assert plan is not None
+    commands = []
+
+    def runner(command, **kwargs):
+        commands.append((command, kwargs))
+        if command == ["git", "status", "--porcelain"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    prepare_self_evolution_branch(plan, command_runner=runner)
+    result = run_self_evolution_agent(
+        plan,
+        output_dir=tmp_path / "out",
+        model="test-model",
+        config_spec=["mini.yaml"],
+        command_runner=runner,
+    )
+
+    assert commands[0][0] == ["git", "status", "--porcelain"]
+    assert commands[1][0] == ["git", "switch", "-c", plan.branch_name]
+    nested_command = commands[2][0]
+    assert nested_command[1:4] == ["-m", "minisweagent.run.mini", "--task"]
+    assert "--exit-immediately" in nested_command
+    model_index = nested_command.index("--model")
+    config_index = nested_command.index("--config")
+    assert nested_command[model_index : model_index + 2] == ["--model", "test-model"]
+    assert nested_command[config_index : config_index + 2] == ["--config", "mini.yaml"]
+    assert result.returncode == 0
+    assert result.task_path.exists()
