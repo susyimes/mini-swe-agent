@@ -1,4 +1,5 @@
 .cursor/rules/_*
+.mini-swe-agent/
 uv.lock
 patch.txt
 exit_statuses*.yaml

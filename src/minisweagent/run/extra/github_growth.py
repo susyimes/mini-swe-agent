@@ -2,6 +2,9 @@
 
 import json
 import os
+import shlex
+import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,11 +15,12 @@ import requests
 import typer
 from rich.console import Console
 
-_HELP_TEXT = """Collect recent GitHub activity and turn it into reviewable growth proposals.
+_HELP_TEXT = """Collect recent GitHub activity and turn it into a self-evolution loop.
 
-The command is intentionally read-only against GitHub. It writes local digest/state
-files so a scheduler can run it every hour without giving the agent direct write
-access to code, issues, or pull requests.
+By default the command is read-only against GitHub and writes local digest/state
+files. With `--evolution-mode plan` it turns signals into a concrete self-improvement
+task. With `--evolution-mode agent` it creates a branch and asks mini-swe-agent to
+modify this repository itself.
 """
 
 DEFAULT_TOPICS = (
@@ -103,6 +107,31 @@ class DigestWriteResult:
     json_path: Path
     markdown_path: Path
     state_path: Path
+
+
+@dataclass(frozen=True)
+class SelfEvolutionPlan:
+    """A bounded task that mini-swe-agent can run against its own checkout."""
+
+    generated_at: str
+    repo_path: str
+    branch_name: str
+    task: str
+    proposals: list[dict[str, Any]]
+    source_digest_generated_at: str
+
+
+@dataclass(frozen=True)
+class SelfEvolutionRunResult:
+    """Result of invoking mini-swe-agent on its own self-evolution task."""
+
+    command: list[str]
+    returncode: int
+    task_path: Path
+    trajectory_path: Path
+    branch_name: str
+    stdout_tail: str
+    stderr_tail: str
 
 
 class GitHubEventsClient:
@@ -331,7 +360,7 @@ def build_digest(repos: list[str], events: list[GitHubEvent], signals: list[Grow
         "proposals": build_proposals(signals),
         "safety": {
             "github_writes": False,
-            "code_writes": False,
+            "code_writes": "only when --evolution-mode agent is explicitly selected",
             "requires_review_before_self_update": True,
         },
     }
@@ -393,6 +422,246 @@ def render_markdown_digest(digest: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def build_self_evolution_plan(
+    digest: dict[str, Any],
+    *,
+    repo_path: Path,
+    branch_prefix: str = "codex/self-evolve",
+    max_proposals: int = 3,
+    force: bool = False,
+    extra_instructions: str = "",
+) -> SelfEvolutionPlan | None:
+    """Turn a digest into a concrete mini-swe-agent task for self-improvement."""
+
+    proposals = list(digest.get("proposals", []))[:max_proposals]
+    if not proposals and not force:
+        return None
+    if not proposals:
+        proposals = [
+            {
+                "title": "Improve the GitHub growth self-evolution loop",
+                "source_url": "",
+                "risk": "normal",
+                "why_it_matters": "No external signal matched; use this pass to improve observability or tests.",
+                "suggested_next_step": "Make one small, test-covered improvement to the github-growth controller.",
+                "approval_gate": "Open a reviewed PR before merging.",
+            }
+        ]
+
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    branch_name = build_evolution_branch_name(branch_prefix, generated_at, proposals[0]["title"])
+    task = render_self_evolution_task(
+        proposals,
+        repo_path=repo_path,
+        branch_name=branch_name,
+        digest_generated_at=str(digest.get("generated_at", "")),
+        extra_instructions=extra_instructions,
+    )
+    return SelfEvolutionPlan(
+        generated_at=generated_at,
+        repo_path=str(repo_path),
+        branch_name=branch_name,
+        task=task,
+        proposals=proposals,
+        source_digest_generated_at=str(digest.get("generated_at", "")),
+    )
+
+
+def build_evolution_branch_name(branch_prefix: str, generated_at: str, title: str) -> str:
+    stamp = generated_at.replace("-", "").replace(":", "").replace("+00:00", "Z").replace("Z", "")
+    slug = slugify_branch_part(title)[:48] or "mini-swe-agent-growth"
+    return f"{branch_prefix.strip('/')}/{stamp}-{slug}"
+
+
+def slugify_branch_part(value: str) -> str:
+    chars: list[str] = []
+    previous_dash = False
+    for char in value.lower():
+        if char.isalnum():
+            chars.append(char)
+            previous_dash = False
+        elif not previous_dash:
+            chars.append("-")
+            previous_dash = True
+    return "".join(chars).strip("-")
+
+
+def render_self_evolution_task(
+    proposals: list[dict[str, Any]],
+    *,
+    repo_path: Path,
+    branch_name: str,
+    digest_generated_at: str,
+    extra_instructions: str = "",
+) -> str:
+    proposal_lines: list[str] = []
+    for index, proposal in enumerate(proposals, start=1):
+        proposal_lines.extend(
+            [
+                f"{index}. {proposal['title']}",
+                f"   Source: {proposal.get('source_url') or 'local controller fallback'}",
+                f"   Risk: {proposal.get('risk', 'normal')}",
+                f"   Why: {proposal.get('why_it_matters', '')}",
+                f"   Suggested next step: {proposal.get('suggested_next_step', '')}",
+            ]
+        )
+    extra = f"\nAdditional operator instructions:\n{extra_instructions.strip()}\n" if extra_instructions.strip() else ""
+    return "\n".join(
+        [
+            "You are mini-swe-agent improving mini-swe-agent itself.",
+            "",
+            f"Repository path: {repo_path}",
+            f"Working branch prepared by controller: {branch_name}",
+            f"Growth digest generated at: {digest_generated_at}",
+            "",
+            "Goal:",
+            "Implement one small, coherent self-improvement inspired by the proposals below.",
+            "Prefer changes that improve agent reliability, validation, observability, or developer workflow.",
+            "",
+            "Proposals:",
+            *proposal_lines,
+            "",
+            "Operating constraints:",
+            "- Stay inside this repository.",
+            "- Do not read, print, modify, or commit secrets, tokens, credentials, or private user files.",
+            "- Do not push, merge, publish packages, deploy, or call external write APIs.",
+            "- Keep the diff focused enough for a human reviewer to understand quickly.",
+            "- Add or update tests or docs whenever behavior changes.",
+            "- Run the narrowest useful validation command and include the result in the final answer.",
+            "- If the proposals are unsafe or too vague, improve the self-evolution controller's safety or tests instead.",
+            "",
+            "Completion criteria:",
+            "- The repository has a concrete local diff on this branch, or a clear no-op explanation if no safe change exists.",
+            "- The final answer summarizes changed files, validation, and remaining review notes.",
+            extra,
+        ]
+    )
+
+
+def write_self_evolution_plan(output_dir: Path, plan: SelfEvolutionPlan) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    json_path = output_dir / f"self-evolution-plan-{timestamp}.json"
+    markdown_path = output_dir / f"self-evolution-plan-{timestamp}.md"
+    json_text = json.dumps(asdict(plan), indent=2, sort_keys=True) + "\n"
+    markdown_text = "\n".join(
+        [
+            "# Self-Evolution Plan",
+            "",
+            f"Generated: {plan.generated_at}",
+            f"Branch: `{plan.branch_name}`",
+            f"Repository: `{plan.repo_path}`",
+            "",
+            "## Task",
+            "",
+            plan.task,
+        ]
+    )
+    json_path.write_text(json_text, encoding="utf-8")
+    markdown_path.write_text(markdown_text + "\n", encoding="utf-8")
+    (output_dir / "latest-self-evolution-plan.json").write_text(json_text, encoding="utf-8")
+    (output_dir / "latest-self-evolution-plan.md").write_text(markdown_text + "\n", encoding="utf-8")
+    return json_path, markdown_path
+
+
+def prepare_self_evolution_branch(
+    plan: SelfEvolutionPlan,
+    *,
+    allow_dirty: bool = False,
+    command_runner: Any = subprocess.run,
+) -> None:
+    repo_path = Path(plan.repo_path)
+    if not allow_dirty:
+        status = run_controller_command(["git", "status", "--porcelain"], cwd=repo_path, command_runner=command_runner)
+        if status.stdout.strip():
+            raise RuntimeError("Refusing self-evolution on a dirty worktree. Commit/stash changes or pass --allow-dirty.")
+    run_controller_command(["git", "switch", "-c", plan.branch_name], cwd=repo_path, command_runner=command_runner, check=True)
+
+
+def run_self_evolution_agent(
+    plan: SelfEvolutionPlan,
+    *,
+    output_dir: Path,
+    model: str | None = None,
+    config_spec: list[str] | None = None,
+    timeout_seconds: int = 3600,
+    command_runner: Any = subprocess.run,
+) -> SelfEvolutionRunResult:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    task_path = output_dir / f"self-evolution-task-{timestamp}.md"
+    trajectory_path = output_dir / f"self-evolution-{timestamp}.traj.json"
+    task_path.write_text(plan.task, encoding="utf-8")
+    command = [
+        sys.executable,
+        "-m",
+        "minisweagent.run.mini",
+        "--task",
+        plan.task,
+        "--output",
+        str(trajectory_path),
+        "--exit-immediately",
+    ]
+    if model:
+        command.extend(["--model", model])
+    for spec in config_spec or []:
+        command.extend(["--config", spec])
+    completed = run_controller_command(
+        command,
+        cwd=Path(plan.repo_path),
+        command_runner=command_runner,
+        timeout=timeout_seconds,
+    )
+    result = SelfEvolutionRunResult(
+        command=command,
+        returncode=completed.returncode,
+        task_path=task_path,
+        trajectory_path=trajectory_path,
+        branch_name=plan.branch_name,
+        stdout_tail=tail_text(completed.stdout),
+        stderr_tail=tail_text(completed.stderr),
+    )
+    (output_dir / "latest-self-evolution-run.json").write_text(
+        json.dumps(
+            {
+                "command": result.command,
+                "returncode": result.returncode,
+                "task_path": str(result.task_path),
+                "trajectory_path": str(result.trajectory_path),
+                "branch_name": result.branch_name,
+                "stdout_tail": result.stdout_tail,
+                "stderr_tail": result.stderr_tail,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return result
+
+
+def run_controller_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    command_runner: Any = subprocess.run,
+    timeout: int = 30,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    completed = command_runner(command, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if check and completed.returncode != 0:
+        rendered = " ".join(shlex.quote(part) for part in command)
+        raise RuntimeError(f"Command failed ({completed.returncode}): {rendered}\n{completed.stderr}")
+    return completed
+
+
+def tail_text(value: str, *, limit: int = 4000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[-limit:]
+
+
 def run_intake_once(
     *,
     repos: list[str],
@@ -448,11 +717,24 @@ def main(
     lookback_hours: int = typer.Option(1, "--lookback-hours", min=1, help="Initial lookback window when no state exists."),
     max_events_per_repo: int = typer.Option(100, "--max-events-per-repo", min=1, max=100, help="GitHub event fetch limit per repo."),
     interval_seconds: int = typer.Option(0, "--interval-seconds", min=0, help="Run forever at this interval; 0 runs exactly once."),
+    evolution_mode: str = typer.Option("digest", "--evolution-mode", help="One of: digest, plan, agent."),
+    repo_path: Path = typer.Option(Path("."), "--repo-path", help="mini-swe-agent checkout to improve in plan/agent mode."),
+    force_evolve: bool = typer.Option(False, "--force-evolve", help="Create a fallback self-evolution task even without matched signals."),
+    branch_prefix: str = typer.Option("codex/self-evolve", "--branch-prefix", help="Branch prefix used by agent mode."),
+    model: str | None = typer.Option(None, "-m", "--model", help="Model to pass to mini in agent mode."),
+    config_spec: list[str] | None = typer.Option(None, "-c", "--config", help="Config spec(s) to pass to mini in agent mode."),
+    allow_dirty: bool = typer.Option(False, "--allow-dirty", help="Allow agent mode to start from a dirty worktree."),
+    agent_timeout_seconds: int = typer.Option(3600, "--agent-timeout-seconds", min=1, help="Timeout for the nested mini run."),
+    extra_instruction: str = typer.Option("", "--extra-instruction", help="Additional instruction appended to the self-evolution task."),
 ) -> None:
     # fmt: on
     repo_list = parse_comma_separated(repos)
     if not repo_list:
         raise typer.BadParameter("Pass at least one repository with --repos owner/name")
+    if evolution_mode not in {"digest", "plan", "agent"}:
+        raise typer.BadParameter("--evolution-mode must be one of: digest, plan, agent")
+    if evolution_mode == "agent" and interval_seconds > 0:
+        raise typer.BadParameter("--evolution-mode agent is one-shot; use a scheduler to launch separate runs")
     topic_list = parse_comma_separated(topics) or list(DEFAULT_TOPICS)
     token = os.getenv(token_env)
 
@@ -469,6 +751,32 @@ def main(
         console.print(
             f"Wrote {len(result.digest['signals'])} signal(s) to [bold green]{result.markdown_path}[/bold green]"
         )
+        if evolution_mode in {"plan", "agent"}:
+            plan = build_self_evolution_plan(
+                result.digest,
+                repo_path=repo_path.resolve(),
+                branch_prefix=branch_prefix,
+                force=force_evolve,
+                extra_instructions=extra_instruction,
+            )
+            if plan is None:
+                console.print("No self-evolution plan created because no proposals matched this pass.")
+            else:
+                _, markdown_path = write_self_evolution_plan(output_dir, plan)
+                console.print(f"Wrote self-evolution plan to [bold green]{markdown_path}[/bold green]")
+                if evolution_mode == "agent":
+                    prepare_self_evolution_branch(plan, allow_dirty=allow_dirty)
+                    run_result = run_self_evolution_agent(
+                        plan,
+                        output_dir=output_dir,
+                        model=model,
+                        config_spec=config_spec,
+                        timeout_seconds=agent_timeout_seconds,
+                    )
+                    console.print(
+                        f"Self-evolution agent exited with {run_result.returncode}; trajectory: "
+                        f"[bold green]{run_result.trajectory_path}[/bold green]"
+                    )
         if interval_seconds <= 0:
             break
         time.sleep(interval_seconds)
