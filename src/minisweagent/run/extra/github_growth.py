@@ -1,0 +1,478 @@
+"""Hourly GitHub intake for a bounded self-improvement loop."""
+
+import json
+import os
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+import typer
+from rich.console import Console
+
+_HELP_TEXT = """Collect recent GitHub activity and turn it into reviewable growth proposals.
+
+The command is intentionally read-only against GitHub. It writes local digest/state
+files so a scheduler can run it every hour without giving the agent direct write
+access to code, issues, or pull requests.
+"""
+
+DEFAULT_TOPICS = (
+    "agent",
+    "automation",
+    "benchmark",
+    "bug",
+    "config",
+    "github",
+    "release",
+    "security",
+    "test",
+    "workflow",
+)
+INTERESTING_EVENT_TYPES = {
+    "IssuesEvent",
+    "IssueCommentEvent",
+    "PullRequestEvent",
+    "PullRequestReviewEvent",
+    "PushEvent",
+    "ReleaseEvent",
+    "WorkflowRunEvent",
+}
+HIGH_RISK_TERMS = ("auth", "credential", "secret", "security", "token")
+
+app = typer.Typer(rich_markup_mode="rich", add_completion=False)
+console = Console(highlight=False)
+
+
+@dataclass(frozen=True)
+class GitHubEvent:
+    """Normalized GitHub event with only the fields the growth loop needs."""
+
+    id: str
+    repo: str
+    kind: str
+    actor: str
+    created_at: str
+    title: str
+    url: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class GrowthSignal:
+    """A filtered event that may be worth turning into an improvement proposal."""
+
+    event_id: str
+    repo: str
+    kind: str
+    title: str
+    url: str
+    relevance: str
+    risk: str
+    recommended_action: str
+
+
+@dataclass
+class GrowthState:
+    """Cursor state for scheduled GitHub intake."""
+
+    seen_event_ids: set[str] = field(default_factory=set)
+    last_seen_at_by_repo: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GrowthState":
+        return cls(
+            seen_event_ids=set(data.get("seen_event_ids", [])),
+            last_seen_at_by_repo=dict(data.get("last_seen_at_by_repo", {})),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seen_event_ids": sorted(self.seen_event_ids),
+            "last_seen_at_by_repo": dict(sorted(self.last_seen_at_by_repo.items())),
+        }
+
+
+@dataclass(frozen=True)
+class DigestWriteResult:
+    """Paths written by one intake pass."""
+
+    digest: dict[str, Any]
+    json_path: Path
+    markdown_path: Path
+    state_path: Path
+
+
+class GitHubEventsClient:
+    """Small GitHub REST client for repository event feeds."""
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        session: requests.Session | None = None,
+        api_base_url: str = "https://api.github.com",
+        timeout: int = 30,
+    ) -> None:
+        self._session = session or requests.Session()
+        self._api_base_url = api_base_url.rstrip("/")
+        self._timeout = timeout
+        self._headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mini-swe-agent-github-growth",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            self._headers["Authorization"] = f"Bearer {token}"
+
+    def list_repository_events(self, repo: str, *, per_page: int = 100) -> list[dict[str, Any]]:
+        owner, name = parse_repo_spec(repo)
+        response = self._session.get(
+            f"{self._api_base_url}/repos/{owner}/{name}/events",
+            headers=self._headers,
+            params={"per_page": per_page},
+            timeout=self._timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"GitHub events request failed for {repo}: HTTP {response.status_code}")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise RuntimeError(f"GitHub events request failed for {repo}: expected a JSON list")
+        return payload
+
+
+def parse_repo_spec(repo: str) -> tuple[str, str]:
+    parts = [part.strip() for part in repo.split("/") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"Repository must be in owner/name form: {repo}")
+    return parts[0], parts[1]
+
+
+def parse_comma_separated(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def load_state(path: Path) -> GrowthState:
+    if not path.exists():
+        return GrowthState()
+    return GrowthState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def save_state(path: Path, state: GrowthState) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def parse_github_timestamp(value: str) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def normalize_event(repo: str, raw: dict[str, Any]) -> GitHubEvent:
+    payload = raw.get("payload") or {}
+    kind = str(raw.get("type") or "UnknownEvent")
+    actor = (raw.get("actor") or {}).get("login") or ""
+    event_id = str(raw.get("id") or f"{repo}:{kind}:{raw.get('created_at', '')}")
+    created_at = str(raw.get("created_at") or "")
+
+    title, url, summary = _event_text(repo, kind, payload)
+    return GitHubEvent(
+        id=event_id,
+        repo=repo,
+        kind=kind,
+        actor=actor,
+        created_at=created_at,
+        title=title,
+        url=url,
+        summary=summary,
+    )
+
+
+def _event_text(repo: str, kind: str, payload: dict[str, Any]) -> tuple[str, str, str]:
+    if kind == "PullRequestEvent":
+        pr = payload.get("pull_request") or {}
+        title = _compact(pr.get("title") or "untitled pull request")
+        action = payload.get("action") or "updated"
+        return f"{action} pull request: {title}", pr.get("html_url") or _repo_url(repo), _compact(pr.get("body") or "")
+    if kind in {"IssuesEvent", "IssueCommentEvent"}:
+        issue = payload.get("issue") or {}
+        title = _compact(issue.get("title") or "untitled issue")
+        action = payload.get("action") or "updated"
+        comment = payload.get("comment") or {}
+        body = comment.get("body") or issue.get("body") or ""
+        return f"{action} issue: {title}", issue.get("html_url") or _repo_url(repo), _compact(body)
+    if kind == "ReleaseEvent":
+        release = payload.get("release") or {}
+        name = _compact(release.get("name") or release.get("tag_name") or "release")
+        action = payload.get("action") or "published"
+        return f"{action} release: {name}", release.get("html_url") or _repo_url(repo), _compact(release.get("body") or "")
+    if kind == "PushEvent":
+        commits = payload.get("commits") or []
+        ref = str(payload.get("ref") or "").removeprefix("refs/heads/")
+        messages = [_compact(commit.get("message") or "") for commit in commits if isinstance(commit, dict)]
+        summary = "; ".join(message for message in messages if message)
+        title = f"push to {ref or 'repository'}"
+        if messages:
+            title = f"{title}: {messages[0]}"
+        url = _repo_url(repo)
+        if len(commits) == 1 and isinstance(commits[0], dict) and commits[0].get("sha"):
+            url = f"{_repo_url(repo)}/commit/{commits[0]['sha']}"
+        return title, url, summary
+    if kind == "CreateEvent":
+        ref_type = payload.get("ref_type") or "ref"
+        ref = payload.get("ref") or ""
+        return f"created {ref_type}: {ref}", _repo_url(repo), ""
+    if kind == "ForkEvent":
+        forkee = payload.get("forkee") or {}
+        return f"forked to {forkee.get('full_name', 'unknown fork')}", forkee.get("html_url") or _repo_url(repo), ""
+    return kind, _repo_url(repo), _compact(json.dumps(payload, sort_keys=True)[:500])
+
+
+def _compact(value: object) -> str:
+    return " ".join(str(value).split())
+
+
+def _repo_url(repo: str) -> str:
+    return f"https://github.com/{repo}"
+
+
+def select_new_events(
+    repo: str,
+    raw_events: list[dict[str, Any]],
+    state: GrowthState,
+    *,
+    lookback_hours: int,
+    max_events: int,
+) -> list[GitHubEvent]:
+    newest_seen_at = state.last_seen_at_by_repo.get(repo)
+    if newest_seen_at:
+        since = parse_github_timestamp(newest_seen_at)
+    else:
+        since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+
+    selected: list[GitHubEvent] = []
+    for raw in raw_events:
+        event = normalize_event(repo, raw)
+        created_at = parse_github_timestamp(event.created_at)
+        if event.id in state.seen_event_ids or created_at < since:
+            continue
+        selected.append(event)
+        if len(selected) >= max_events:
+            break
+    return selected
+
+
+def update_state(state: GrowthState, events: list[GitHubEvent]) -> None:
+    for event in events:
+        state.seen_event_ids.add(event.id)
+        current = state.last_seen_at_by_repo.get(event.repo)
+        if current is None or parse_github_timestamp(event.created_at) > parse_github_timestamp(current):
+            state.last_seen_at_by_repo[event.repo] = event.created_at
+
+
+def extract_growth_signals(events: list[GitHubEvent], *, topics: list[str]) -> list[GrowthSignal]:
+    topic_terms = [topic.lower() for topic in topics]
+    signals: list[GrowthSignal] = []
+    for event in events:
+        haystack = f"{event.kind} {event.title} {event.summary}".lower()
+        matched_topics = [topic for topic in topic_terms if topic in haystack]
+        if event.kind not in INTERESTING_EVENT_TYPES and not matched_topics:
+            continue
+        risk = "high" if any(term in haystack for term in HIGH_RISK_TERMS) else "normal"
+        if matched_topics:
+            relevance = "matched topics: " + ", ".join(sorted(set(matched_topics)))
+        else:
+            relevance = f"{event.kind} is useful for observing upstream project movement"
+        signals.append(
+            GrowthSignal(
+                event_id=event.id,
+                repo=event.repo,
+                kind=event.kind,
+                title=event.title,
+                url=event.url,
+                relevance=relevance,
+                risk=risk,
+                recommended_action=recommend_action(event, risk),
+            )
+        )
+    return signals
+
+
+def recommend_action(event: GitHubEvent, risk: str) -> str:
+    if risk == "high":
+        return "summarize the pattern and require human review before borrowing it"
+    if event.kind == "ReleaseEvent":
+        return "review release notes for reusable implementation or workflow changes"
+    if event.kind == "PullRequestEvent":
+        return "compare the pull request approach with local agent behavior before drafting a change"
+    if event.kind == "PushEvent":
+        return "cluster commit messages and keep only patterns with clear test evidence"
+    if event.kind in {"IssuesEvent", "IssueCommentEvent"}:
+        return "turn the issue signal into a small hypothesis and validation checklist"
+    return "capture the lesson as a proposal; do not mutate the project automatically"
+
+
+def build_digest(repos: list[str], events: list[GitHubEvent], signals: list[GrowthSignal]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": {
+            "repos": repos,
+            "mode": "read-only github events intake",
+        },
+        "events": [asdict(event) for event in events],
+        "signals": [asdict(signal) for signal in signals],
+        "proposals": build_proposals(signals),
+        "safety": {
+            "github_writes": False,
+            "code_writes": False,
+            "requires_review_before_self_update": True,
+        },
+    }
+
+
+def build_proposals(signals: list[GrowthSignal], *, limit: int = 5) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
+    for signal in signals[:limit]:
+        proposals.append(
+            {
+                "title": f"Borrow cautiously from {signal.repo}: {signal.title}",
+                "source_event_id": signal.event_id,
+                "source_url": signal.url,
+                "risk": signal.risk,
+                "why_it_matters": signal.relevance,
+                "suggested_next_step": signal.recommended_action,
+                "approval_gate": "Open a reviewed PR before changing prompts, config, code, or scheduler behavior.",
+            }
+        )
+    return proposals
+
+
+def render_markdown_digest(digest: dict[str, Any]) -> str:
+    lines = [
+        "# GitHub Growth Digest",
+        "",
+        f"Generated: {digest['generated_at']}",
+        "",
+        "## Sources",
+        "",
+    ]
+    for repo in digest["source"]["repos"]:
+        lines.append(f"- `{repo}`")
+    lines.extend(["", "## Signals", ""])
+    if not digest["signals"]:
+        lines.append("No new growth signals matched this pass.")
+    for signal in digest["signals"]:
+        lines.extend(
+            [
+                f"- [{signal['title']}]({signal['url']})",
+                f"  - Repo: `{signal['repo']}`",
+                f"  - Relevance: {signal['relevance']}",
+                f"  - Risk: {signal['risk']}",
+                f"  - Next step: {signal['recommended_action']}",
+            ]
+        )
+    lines.extend(["", "## Proposals", ""])
+    if not digest["proposals"]:
+        lines.append("No proposals generated.")
+    for proposal in digest["proposals"]:
+        lines.extend(
+            [
+                f"- {proposal['title']}",
+                f"  - Why: {proposal['why_it_matters']}",
+                f"  - Next: {proposal['suggested_next_step']}",
+                f"  - Gate: {proposal['approval_gate']}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_intake_once(
+    *,
+    repos: list[str],
+    output_dir: Path,
+    state_path: Path | None = None,
+    token: str | None = None,
+    topics: list[str] | None = None,
+    lookback_hours: int = 1,
+    max_events_per_repo: int = 100,
+    client: GitHubEventsClient | None = None,
+) -> DigestWriteResult:
+    if not repos:
+        raise ValueError("At least one repository is required")
+    normalized_repos = ["/".join(parse_repo_spec(repo)) for repo in repos]
+    state_file = state_path or output_dir / "state.json"
+    state = load_state(state_file)
+    github = client or GitHubEventsClient(token=token)
+
+    events: list[GitHubEvent] = []
+    for repo in normalized_repos:
+        raw_events = github.list_repository_events(repo, per_page=max_events_per_repo)
+        events.extend(
+            select_new_events(repo, raw_events, state, lookback_hours=lookback_hours, max_events=max_events_per_repo)
+        )
+    events.sort(key=lambda event: parse_github_timestamp(event.created_at), reverse=True)
+    signals = extract_growth_signals(events, topics=topics or list(DEFAULT_TOPICS))
+    digest = build_digest(normalized_repos, events, signals)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"github-growth-digest-{timestamp}.json"
+    markdown_path = output_dir / f"github-growth-digest-{timestamp}.md"
+    json_text = json.dumps(digest, indent=2, sort_keys=True) + "\n"
+    markdown_text = render_markdown_digest(digest)
+    json_path.write_text(json_text, encoding="utf-8")
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+    (output_dir / "latest.json").write_text(json_text, encoding="utf-8")
+    (output_dir / "latest.md").write_text(markdown_text, encoding="utf-8")
+
+    update_state(state, events)
+    save_state(state_file, state)
+    return DigestWriteResult(digest=digest, json_path=json_path, markdown_path=markdown_path, state_path=state_file)
+
+
+# fmt: off
+@app.command(help=_HELP_TEXT)
+def main(
+    repos: str = typer.Option("", "--repos", "-r", help="Comma-separated GitHub repositories in owner/name form."),
+    output_dir: Path = typer.Option(Path(".mini-swe-agent/github-growth"), "--output-dir", "-o", help="Directory for digest and state files."),
+    state_path: Path | None = typer.Option(None, "--state", help="State file path. Defaults to <output-dir>/state.json."),
+    token_env: str = typer.Option("GITHUB_TOKEN", "--token-env", help="Environment variable containing a GitHub token."),
+    topics: str = typer.Option("", "--topics", help="Comma-separated relevance terms. Defaults to agent/workflow/test/security topics."),
+    lookback_hours: int = typer.Option(1, "--lookback-hours", min=1, help="Initial lookback window when no state exists."),
+    max_events_per_repo: int = typer.Option(100, "--max-events-per-repo", min=1, max=100, help="GitHub event fetch limit per repo."),
+    interval_seconds: int = typer.Option(0, "--interval-seconds", min=0, help="Run forever at this interval; 0 runs exactly once."),
+) -> None:
+    # fmt: on
+    repo_list = parse_comma_separated(repos)
+    if not repo_list:
+        raise typer.BadParameter("Pass at least one repository with --repos owner/name")
+    topic_list = parse_comma_separated(topics) or list(DEFAULT_TOPICS)
+    token = os.getenv(token_env)
+
+    while True:
+        result = run_intake_once(
+            repos=repo_list,
+            output_dir=output_dir,
+            state_path=state_path,
+            token=token,
+            topics=topic_list,
+            lookback_hours=lookback_hours,
+            max_events_per_repo=max_events_per_repo,
+        )
+        console.print(
+            f"Wrote {len(result.digest['signals'])} signal(s) to [bold green]{result.markdown_path}[/bold green]"
+        )
+        if interval_seconds <= 0:
+            break
+        time.sleep(interval_seconds)
+
+
+if __name__ == "__main__":
+    app()
